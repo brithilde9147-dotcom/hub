@@ -332,7 +332,7 @@ async function main() {
 
   await prisma.user.upsert({
     where: { email: 'synthetic-admin@example.test' },
-    update: {},
+    update: { passwordHash: adminHash },
     create: {
       name: 'Synthetic Admin (TEST ONLY)',
       email: 'synthetic-admin@example.test',
@@ -344,7 +344,7 @@ async function main() {
 
   await prisma.user.upsert({
     where: { email: 'synthetic-collab@example.test' },
-    update: {},
+    update: { passwordHash: collabHash },
     create: {
       name: 'Synthetic Collaborator (TEST ONLY)',
       email: 'synthetic-collab@example.test',
