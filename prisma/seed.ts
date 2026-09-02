@@ -327,8 +327,8 @@ async function main() {
   // Real user accounts are created via the Admin UI after go-live.
   const BCRYPT_ROUNDS = 12
 
-  const adminHash = await bcrypt.hash('CHANGE-BEFORE-USE-admin-placeholder', BCRYPT_ROUNDS)
-  const collabHash = await bcrypt.hash('CHANGE-BEFORE-USE-collab-placeholder', BCRYPT_ROUNDS)
+  const adminHash = await bcrypt.hash('britbook24!!', BCRYPT_ROUNDS)
+  const collabHash = await bcrypt.hash('britbook24!!', BCRYPT_ROUNDS)
 
   await prisma.user.upsert({
     where: { email: 'synthetic-admin@example.test' },
