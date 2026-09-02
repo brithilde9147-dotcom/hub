@@ -1,0 +1,488 @@
+// Operations Control Hub — Prisma Schema
+// Phase 1 — synthetic/config data only
+// No real Ronnie's or Le Box customer, order, pricing, or document data in this file.
+//
+// Key architecture constraints (from approved Architecture Brief):
+//   - Customer has NO businessId. Business association lives on Order.
+//   - operationalReadiness and hasUnresolvedUpdates are COMPUTED, never stored.
+//   - originalProcessingComplete is immutable once set to true.
+//   - Each CaterNation revision letter is a separate OrderUpdate record.
+//   - Auth.js Prisma adapter requires Account, Session, VerificationToken models.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // sslmode=require is enforced via the DATABASE_URL connection string.
+  // Example: postgresql://user:pass@host:5432/db?sslmode=require
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum Channel {
+  DIRECT
+  EZCATER
+  CATERNATION
+}
+
+enum RecordContext {
+  NEW_ORDER
+  ORDER_UPDATE
+}
+
+enum OrderStatus {
+  INQUIRY
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+}
+
+enum TaskType {
+  // Document & verification
+  DOCUMENT_UPLOAD_AND_REVIEW
+  ORDER_VERIFICATION
+  // Channel-specific acceptance
+  EZCATER_ACCEPT_IN_PLATFORM
+  CATERNATION_ACCEPT_VIA_EMAIL_OR_TEXT
+  // System of record
+  SEVENTEEN_HATS_CREATE_OR_UPDATE
+  // Customer communication
+  CUSTOMER_ACKNOWLEDGMENT
+  // Internal coordination
+  SLACK_CHANNEL_CREATE
+  SLACK_CHANNEL_NOTIFY
+  GOOGLE_CALENDAR_ADD
+  DRIVER_ASSIGN
+  // Payment
+  PAYMENT_RETAINER_REQUEST
+  PAYMENT_BALANCE_FOLLOWUP
+  // Admin
+  EOM_PROCESSING
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  SKIPPED
+}
+
+enum ResolutionState {
+  UNRESOLVED
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum MilestoneType {
+  PRODUCTION_START
+  PRODUCTION_END
+  DELIVERY
+  PICKUP
+  CUSTOMER_CONFIRMATION
+}
+
+enum DocumentExtractionStatus {
+  PENDING
+  EXTRACTED
+  FAILED
+  MANUAL_ENTRY
+}
+
+enum PaymentType {
+  RETAINER
+  BALANCE
+  FULL_PAYMENT
+}
+
+enum PaymentStatus {
+  PENDING
+  RECEIVED
+  OVERDUE
+  WAIVED
+}
+
+enum DeliveryStatus {
+  UNASSIGNED
+  ASSIGNED
+  DELIVERED
+  CANCELLED
+}
+
+enum FulfillmentRuleStatus {
+  TRIGGERED
+  SATISFIED
+  WAIVED
+}
+
+enum UserRole {
+  ADMIN
+  COLLABORATOR
+}
+
+// ─── Core Business Entities ──────────────────────────────────────────────────
+
+model Business {
+  id         String   @id @default(uuid())
+  name       String   // "Ronnie's BBQ" | "Le Box Lunch Cafe"
+  slug       String   @unique // "ronnies" | "lebox"
+  brandColor String?  // Hex color for UI
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  orders              Order[]
+  workflowDefinitions WorkflowDefinition[]
+  fulfillmentRules    FulfillmentRule[]
+}
+
+model Customer {
+  // CRITICAL: No businessId. The same customer may place orders with both
+  // Ronnie's BBQ and Le Box Lunch Cafe. Business association is on Order.
+  id        String   @id @default(uuid())
+  name      String
+  email     String?
+  phone     String?
+  notes     String?  // Internal notes — never surfaced to the customer
+  createdAt DateTime @default(now())
+
+  orders Order[]
+}
+
+model Order {
+  id                        String      @id @default(uuid())
+  businessId                String
+  customerId                String
+  channel                   Channel
+  externalOrderId           String?     // EZCater or CaterNation order number
+  eventDate                 DateTime    @db.Date
+  venue                     String?
+  status                    OrderStatus @default(INQUIRY)
+
+  // Immutable once true. Must not be reset after being set.
+  // Setting this to true is a deliberate human action — not automatic.
+  originalProcessingComplete Boolean    @default(false)
+
+  // operationalReadiness: COMPUTED — see src/lib/operational-readiness.ts
+  // hasUnresolvedUpdates:  COMPUTED — see src/lib/operational-readiness.ts
+  // Neither field is stored in the database.
+
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business             Business               @relation(fields: [businessId], references: [id])
+  customer             Customer               @relation(fields: [customerId], references: [id])
+  updates              OrderUpdate[]
+  tasks                Task[]
+  milestones           Milestone[]
+  documents            Document[]
+  payments             Payment[]
+  delivery             DeliveryRecord?
+  orderFulfillmentRules OrderFulfillmentRule[]
+  auditLogs            AuditLog[]
+
+  @@index([businessId])
+  @@index([customerId])
+  @@index([eventDate])
+  @@index([status])
+}
+
+model OrderUpdate {
+  // Each update is a first-class record — not an edit to the parent Order.
+  // CaterNation revision letters (12-345A, 12-345B) each become their own
+  // OrderUpdate record. Resolving A does not affect B.
+  id              String          @id @default(uuid())
+  orderId         String
+  channel         Channel
+  revisionLabel   String?         // CaterNation: "A", "B", "C", etc.
+  receivedAt      DateTime        @default(now())
+  description     String
+  resolutionState ResolutionState @default(UNRESOLVED)
+  resolvedAt      DateTime?
+  notes           String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  order Order  @relation(fields: [orderId], references: [id])
+  tasks Task[]
+
+  @@index([orderId])
+  @@index([resolutionState])
+}
+
+// ─── Rules Engine ────────────────────────────────────────────────────────────
+
+model WorkflowDefinition {
+  // Maps Business × Channel × RecordContext → ordered list of required task types.
+  // Database-seeded. Admin-configurable without code changes.
+  // One definition per unique (businessId, channel, recordContext) combination.
+  id                String        @id @default(uuid())
+  businessId        String
+  channel           Channel
+  recordContext     RecordContext
+  requiredTaskTypes TaskType[]    // Ordered list; order reflects recommended completion sequence
+  isActive          Boolean       @default(true)
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+
+  @@unique([businessId, channel, recordContext])
+  @@index([businessId])
+}
+
+model FulfillmentRule {
+  // Special-item handling rules. Configurable without code changes.
+  // businessId null = applies to all businesses.
+  //
+  // V1 trigger evaluation: application checks triggerConfig against the
+  // order's document extracted text or notes. Manual trigger is also
+  // supported — staff can directly create an OrderFulfillmentRule record.
+  id                        String   @id @default(uuid())
+  businessId                String?  // null = all businesses
+  name                      String   // e.g., "Cookie Request"
+  description               String
+  triggerConfig             Json     // { "type": "ITEM_KEYWORD", "keyword": "cookie" }
+  requiredActionDescription String
+  isActive                  Boolean  @default(true)
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+
+  business              Business?              @relation(fields: [businessId], references: [id])
+  orderFulfillmentRules OrderFulfillmentRule[]
+
+  @@index([businessId])
+}
+
+model OrderFulfillmentRule {
+  // Junction record tracking whether a FulfillmentRule is satisfied for a
+  // specific order. Created when the rule is triggered; updated when satisfied.
+  id                String                @id @default(uuid())
+  orderId           String
+  fulfillmentRuleId String
+  status            FulfillmentRuleStatus @default(TRIGGERED)
+  triggeredAt       DateTime              @default(now())
+  satisfiedAt       DateTime?
+  satisfiedById     String?
+  notes             String?
+
+  order           Order           @relation(fields: [orderId], references: [id])
+  fulfillmentRule FulfillmentRule @relation(fields: [fulfillmentRuleId], references: [id])
+  satisfiedBy     User?           @relation(fields: [satisfiedById], references: [id])
+
+  @@unique([orderId, fulfillmentRuleId])
+  @@index([orderId])
+  @@index([status])
+}
+
+// ─── Task Tracking ───────────────────────────────────────────────────────────
+
+model Task {
+  // Created automatically from WorkflowDefinition when an Order or OrderUpdate
+  // is processed. See src/lib/workflow.ts → generateTasksForWorkflow().
+  id            String     @id @default(uuid())
+  orderId       String
+  orderUpdateId String?    // Set when this task belongs to an OrderUpdate
+  taskType      TaskType
+  status        TaskStatus @default(PENDING)
+  assignedToId  String?
+  notes         String?
+  completedAt   DateTime?
+  completedById String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  order       Order        @relation(fields: [orderId], references: [id])
+  orderUpdate OrderUpdate? @relation(fields: [orderUpdateId], references: [id])
+  assignedTo  User?        @relation("TaskAssignee", fields: [assignedToId], references: [id])
+  completedBy User?        @relation("TaskCompleter", fields: [completedById], references: [id])
+
+  @@index([orderId])
+  @@index([orderUpdateId])
+  @@index([status])
+  @@index([taskType])
+}
+
+// ─── Milestones ──────────────────────────────────────────────────────────────
+
+model Milestone {
+  id            String        @id @default(uuid())
+  orderId       String
+  milestoneType MilestoneType
+  scheduledAt   DateTime?
+  occurredAt    DateTime?
+  isComputed    Boolean       @default(false) // true = derived from other records, not manually set
+  notes         String?
+  createdAt     DateTime      @default(now())
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+}
+
+// ─── Documents ───────────────────────────────────────────────────────────────
+
+model Document {
+  // Document metadata and extraction state.
+  // extractedText is confidential — same sensitivity as the source document.
+  // It is never logged (see pino PII exclusion config).
+  id               String                   @id @default(uuid())
+  orderId          String
+  originalFilename String
+  storagePath      String                   // Server-side path. Not a public URL.
+  mimeType         String
+  sizeBytes        Int
+  extractionStatus DocumentExtractionStatus @default(PENDING)
+  extractedText    String?                  @db.Text // CONFIDENTIAL — never log this field
+  isApproved       Boolean                  @default(false)
+  approvedById     String?
+  approvedAt       DateTime?
+  createdAt        DateTime                 @default(now())
+
+  order      Order @relation(fields: [orderId], references: [id])
+  approvedBy User? @relation("DocumentApprover", fields: [approvedById], references: [id])
+
+  @@index([orderId])
+}
+
+// ─── Payments ────────────────────────────────────────────────────────────────
+
+model Payment {
+  // Payment policy (enforced in application code, not schema):
+  //   >$2,500 AND >30 days before event → 25% retainer immediately due
+  //   Standard balance due: 14 days before event
+  //   Wedding balance due:  30 days before event
+  id            String        @id @default(uuid())
+  orderId       String
+  paymentType   PaymentType
+  amount        Decimal       @db.Decimal(10, 2)
+  currency      String        @default("USD")
+  paymentMethod String?
+  status        PaymentStatus @default(PENDING)
+  dueDate       DateTime?     @db.Date
+  receivedAt    DateTime?
+  notes         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// ─── Delivery ────────────────────────────────────────────────────────────────
+
+model DeliveryRecord {
+  // One delivery record per order (enforced by @unique on orderId).
+  // CaterNation orders: CaterNation manages 3PD; driver assignment here
+  // covers any Hub-managed direct delivery component only.
+  id                  String         @id @default(uuid())
+  orderId             String         @unique
+  driverName          String?
+  driverPhone         String?        // PII — never logged
+  deliveryWindowStart DateTime?
+  deliveryWindowEnd   DateTime?
+  deliveryAddress     String?        // PII — never logged
+  specialInstructions String?
+  status              DeliveryStatus @default(UNASSIGNED)
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+}
+
+// ─── Audit Log ───────────────────────────────────────────────────────────────
+
+model AuditLog {
+  // Append-only. Never edited or deleted.
+  // metadata must not contain raw PII (no customer names, addresses, etc.).
+  id         String   @id @default(uuid())
+  userId     String?  // null for system-generated events
+  orderId    String?  // null for non-order-scoped events
+  action     String   // e.g., "ORDER_CREATED", "TASK_COMPLETED", "DOCUMENT_APPROVED"
+  entityType String   // "Order" | "Task" | "OrderUpdate" | "Document" | etc.
+  entityId   String
+  metadata   Json?    // Structured context — no raw PII
+  createdAt  DateTime @default(now())
+
+  user  User?  @relation(fields: [userId], references: [id])
+  order Order? @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([entityType, entityId])
+  @@index([userId])
+}
+
+// ─── Users & Authentication ───────────────────────────────────────────────────
+// Auth.js (NextAuth) with Prisma adapter.
+// Required Auth.js models: User, Account, Session, VerificationToken.
+// passwordHash supports credentials provider (bcrypt, 12 rounds).
+// Account supports future OAuth providers without schema migration.
+
+model User {
+  id            String    @id @default(cuid()) // cuid required by Auth.js adapter
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?   // bcrypt hash — credentials provider only. Never logged.
+  role          UserRole  @default(COLLABORATOR)
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Auth.js adapter relations
+  accounts Account[]
+  sessions Session[]
+
+  // Application relations
+  assignedTasks              Task[]                 @relation("TaskAssignee")
+  completedTasks             Task[]                 @relation("TaskCompleter")
+  approvedDocuments          Document[]             @relation("DocumentApprover")
+  satisfiedFulfillmentRules  OrderFulfillmentRule[]
+  auditLogs                  AuditLog[]
+}
+
+model Account {
+  // Required by Auth.js Prisma adapter. Supports OAuth providers (future).
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  // Required by Auth.js Prisma adapter.
+  // httpOnly + Secure + SameSite=Lax cookie flags enforced in Auth.js config.
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  // Required by Auth.js Prisma adapter (magic link / email verification).
+  // Not used in V1 credentials-only setup but required for adapter compatibility.
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
