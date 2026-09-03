@@ -6,26 +6,33 @@
  *   2. WorkflowDefinitions for all 8 Business × Channel × RecordContext combos
  *   3. FulfillmentRules (cookie, mac & cheese, Le Box supporting items)
  *   4. Two synthetic test users (SYNTHETIC — not real staff)
+ *   5. Synthetic orders + items + tasks for dashboard testing
  *
  * Privacy constraint: NO real customer, order, pricing, document,
- * or operational data in this file. Business names and workflow logic
- * are configuration, not customer data.
+ * or operational data in this file. All customer names, companies,
+ * and order data below are entirely fictitious (SYNTHETIC TEST DATA).
+ * Business names and workflow logic are configuration, not customer data.
  *
  * Run: npx prisma db seed
  * Requires: DATABASE_URL set in .env with sslmode=require
  */
 
-import { PrismaClient, TaskType, Channel, RecordContext } from '@prisma/client'
+import {
+  PrismaClient,
+  TaskType,
+  Channel,
+  RecordContext,
+  TaskStatus,
+  OrderStatus,
+  OrderLifecycleState,
+  TaskDueWindowType,
+  TaskVerificationMethod,
+} from '@prisma/client'
 import bcrypt from 'bcrypt'
 
 const prisma = new PrismaClient()
 
 // ─── Business × Channel × RecordContext → required task types ────────────────
-//
-// Task order reflects recommended completion sequence.
-// SKIPPABLE tasks (e.g., DRIVER_ASSIGN for pickup orders) must still
-// appear here — staff mark them SKIPPED when not applicable.
-// Conditional tasks that genuinely never apply to a channel are omitted.
 
 const WORKFLOW_DEFINITIONS: Array<{
   businessSlug: 'ronnies' | 'lebox'
@@ -33,68 +40,59 @@ const WORKFLOW_DEFINITIONS: Array<{
   recordContext: RecordContext
   requiredTaskTypes: TaskType[]
 }> = [
-  // ── Ronnie's BBQ × DIRECT × NEW_ORDER ──────────────────────────────────────
   {
     businessSlug: 'ronnies',
     channel: 'DIRECT',
     recordContext: 'NEW_ORDER',
     requiredTaskTypes: [
-      'DOCUMENT_UPLOAD_AND_REVIEW',   // Intake: upload inquiry/contract docs
-      'ORDER_VERIFICATION',            // Verify event details, headcount, items
-      'SEVENTEEN_HATS_CREATE_OR_UPDATE', // Create 17hats record
-      'SLACK_CHANNEL_CREATE',          // Create order Slack channel
-      'SLACK_CHANNEL_NOTIFY',          // Post order details to channel
-      'GOOGLE_CALENDAR_ADD',           // Add event to production calendar
-      'DRIVER_ASSIGN',                 // Assign driver (mark SKIPPED for pickup)
-      'PAYMENT_RETAINER_REQUEST',      // Request retainer if threshold met (mark SKIPPED if not)
+      'DOCUMENT_UPLOAD_AND_REVIEW',
+      'ORDER_VERIFICATION',
+      'SEVENTEEN_HATS_CREATE_OR_UPDATE',
+      'SLACK_CHANNEL_CREATE',
+      'SLACK_CHANNEL_NOTIFY',
+      'GOOGLE_CALENDAR_ADD',
+      'DRIVER_ASSIGN',
+      'PAYMENT_RETAINER_REQUEST',
     ],
   },
-
-  // ── Ronnie's BBQ × DIRECT × ORDER_UPDATE ───────────────────────────────────
   {
     businessSlug: 'ronnies',
     channel: 'DIRECT',
     recordContext: 'ORDER_UPDATE',
     requiredTaskTypes: [
-      'DOCUMENT_UPLOAD_AND_REVIEW',      // Upload any updated contract/paperwork
-      'ORDER_VERIFICATION',               // Verify the change details
-      'CUSTOMER_ACKNOWLEDGMENT',          // Confirm change with customer
-      'SEVENTEEN_HATS_CREATE_OR_UPDATE',  // Update 17hats record
-      'SLACK_CHANNEL_NOTIFY',             // Notify Slack channel of the change
+      'DOCUMENT_UPLOAD_AND_REVIEW',
+      'ORDER_VERIFICATION',
+      'CUSTOMER_ACKNOWLEDGMENT',
+      'SEVENTEEN_HATS_CREATE_OR_UPDATE',
+      'SLACK_CHANNEL_NOTIFY',
     ],
   },
-
-  // ── Ronnie's BBQ × EZCATER × NEW_ORDER ────────────────────────────────────
   {
     businessSlug: 'ronnies',
     channel: 'EZCATER',
     recordContext: 'NEW_ORDER',
     requiredTaskTypes: [
-      'EZCATER_ACCEPT_IN_PLATFORM',        // Accept/decline in EZCater platform
-      'DOCUMENT_UPLOAD_AND_REVIEW',         // Download & upload order details
-      'ORDER_VERIFICATION',                 // Verify items, delivery window, address
-      'SEVENTEEN_HATS_CREATE_OR_UPDATE',    // Create 17hats record
-      'SLACK_CHANNEL_CREATE',               // Create order Slack channel
-      'SLACK_CHANNEL_NOTIFY',               // Post order details to channel
-      'GOOGLE_CALENDAR_ADD',                // Add event to production calendar
-      'DRIVER_ASSIGN',                      // Assign in-house driver first; mark SKIPPED if 3PD used instead
+      'EZCATER_ACCEPT_IN_PLATFORM',
+      'DOCUMENT_UPLOAD_AND_REVIEW',
+      'ORDER_VERIFICATION',
+      'SEVENTEEN_HATS_CREATE_OR_UPDATE',
+      'SLACK_CHANNEL_CREATE',
+      'SLACK_CHANNEL_NOTIFY',
+      'GOOGLE_CALENDAR_ADD',
+      'DRIVER_ASSIGN',
     ],
   },
-
-  // ── Ronnie's BBQ × EZCATER × ORDER_UPDATE ─────────────────────────────────
   {
     businessSlug: 'ronnies',
     channel: 'EZCATER',
     recordContext: 'ORDER_UPDATE',
     requiredTaskTypes: [
-      'DOCUMENT_UPLOAD_AND_REVIEW',       // Upload updated order doc from EZCater
-      'ORDER_VERIFICATION',                // Verify the change details
-      'SEVENTEEN_HATS_CREATE_OR_UPDATE',   // Update 17hats record
-      'SLACK_CHANNEL_NOTIFY',              // Notify Slack channel of the change
+      'DOCUMENT_UPLOAD_AND_REVIEW',
+      'ORDER_VERIFICATION',
+      'SEVENTEEN_HATS_CREATE_OR_UPDATE',
+      'SLACK_CHANNEL_NOTIFY',
     ],
   },
-
-  // ── Le Box Lunch Cafe × DIRECT × NEW_ORDER ────────────────────────────────
   {
     businessSlug: 'lebox',
     channel: 'DIRECT',
@@ -106,12 +104,10 @@ const WORKFLOW_DEFINITIONS: Array<{
       'SLACK_CHANNEL_CREATE',
       'SLACK_CHANNEL_NOTIFY',
       'GOOGLE_CALENDAR_ADD',
-      'DRIVER_ASSIGN',                  // Mark SKIPPED for pickup orders
-      'PAYMENT_RETAINER_REQUEST',       // Mark SKIPPED if threshold not met
+      'DRIVER_ASSIGN',
+      'PAYMENT_RETAINER_REQUEST',
     ],
   },
-
-  // ── Le Box Lunch Cafe × DIRECT × ORDER_UPDATE ─────────────────────────────
   {
     businessSlug: 'lebox',
     channel: 'DIRECT',
@@ -124,59 +120,45 @@ const WORKFLOW_DEFINITIONS: Array<{
       'SLACK_CHANNEL_NOTIFY',
     ],
   },
-
-  // ── Le Box Lunch Cafe × CATERNATION × NEW_ORDER ───────────────────────────
   {
     businessSlug: 'lebox',
     channel: 'CATERNATION',
     recordContext: 'NEW_ORDER',
     requiredTaskTypes: [
-      'CATERNATION_ACCEPT_VIA_EMAIL_OR_TEXT', // Accept via email or text (not in platform)
-      'DOCUMENT_UPLOAD_AND_REVIEW',            // Le Box downloads & uploads revised invoice
-      'ORDER_VERIFICATION',                    // Verify items, headcount, delivery details
+      'CATERNATION_ACCEPT_VIA_EMAIL_OR_TEXT',
+      'DOCUMENT_UPLOAD_AND_REVIEW',
+      'ORDER_VERIFICATION',
       'SEVENTEEN_HATS_CREATE_OR_UPDATE',
       'SLACK_CHANNEL_CREATE',
       'SLACK_CHANNEL_NOTIFY',
       'GOOGLE_CALENDAR_ADD',
-      'DRIVER_ASSIGN',                         // CaterNation does not manage Hub drivers
+      'DRIVER_ASSIGN',
     ],
   },
-
-  // ── Le Box Lunch Cafe × CATERNATION × ORDER_UPDATE ────────────────────────
   {
     businessSlug: 'lebox',
     channel: 'CATERNATION',
     recordContext: 'ORDER_UPDATE',
-    // CaterNation revision letters (12-345A, 12-345B) each require the full
-    // eight-step update resolution process. Each revision is a separate
-    // OrderUpdate record; resolving one does not affect others.
     requiredTaskTypes: [
-      'DOCUMENT_UPLOAD_AND_REVIEW',        // Le Box downloads revised CaterNation invoice
-      'ORDER_VERIFICATION',                // Verify what changed in this revision
-      'SEVENTEEN_HATS_CREATE_OR_UPDATE',   // Update 17hats record
-      'SLACK_CHANNEL_NOTIFY',              // Notify Slack channel
+      'DOCUMENT_UPLOAD_AND_REVIEW',
+      'ORDER_VERIFICATION',
+      'SEVENTEEN_HATS_CREATE_OR_UPDATE',
+      'SLACK_CHANNEL_NOTIFY',
     ],
   },
 ]
 
 // ─── Fulfillment Rules ────────────────────────────────────────────────────────
-//
-// triggerConfig.type values in V1:
-//   ITEM_KEYWORD:      match keyword against order notes or extracted document text
-//   BUSINESS_SPECIFIC: always triggered for a specific business (when businessId set)
-//
-// In V1, triggering may be manual (staff creates the OrderFulfillmentRule
-// record directly) or keyword-based. See src/lib/fulfillment.ts for evaluation.
 
 const FULFILLMENT_RULES: Array<{
-  businessSlug: 'ronnies' | 'lebox' | null // null = all businesses
+  businessSlug: 'ronnies' | 'lebox' | null
   name: string
   description: string
   triggerConfig: object
   requiredActionDescription: string
 }> = [
   {
-    businessSlug: null, // Applies to Ronnie's and Le Box
+    businessSlug: null,
     name: 'Cookie Request',
     description:
       'Triggered when an order includes a cookie item. Cookies require vendor ' +
@@ -189,14 +171,14 @@ const FULFILLMENT_RULES: Array<{
     },
     requiredActionDescription:
       'Contact cookie vendor to confirm availability and quantity for the event ' +
-      'date before marking this rule satisfied. Document confirmation in notes.',
+      'date before marking this rule satisfied.',
   },
   {
     businessSlug: 'ronnies',
     name: "Mac & Cheese Communication",
     description:
-      "Triggered when a Ronnie's BBQ order includes mac & cheese. The kitchen " +
-      'requires advance notice of mac & cheese quantity to manage prep capacity.',
+      "Triggered when a Ronnie's BBQ order includes mac & cheese. Kitchen requires " +
+      'advance notice of quantity to manage prep capacity.',
     triggerConfig: {
       type: 'ITEM_KEYWORD',
       keyword: 'mac',
@@ -204,15 +186,14 @@ const FULFILLMENT_RULES: Array<{
       caseSensitive: false,
     },
     requiredActionDescription:
-      'Communicate the mac & cheese quantity and event date to the kitchen. ' +
-      'Confirm kitchen acknowledgment before marking this rule satisfied.',
+      'Communicate mac & cheese quantity and event date to the kitchen. ' +
+      'Confirm acknowledgment before marking satisfied.',
   },
   {
     businessSlug: 'lebox',
     name: 'Le Box Supporting Items',
     description:
-      'Triggered when a Le Box order requires supporting items that must be ' +
-      'sourced externally (e.g., specialty items not in standard inventory).',
+      'Triggered when a Le Box order requires supporting items sourced externally.',
     triggerConfig: {
       type: 'ITEM_KEYWORD',
       keyword: 'supporting',
@@ -220,10 +201,25 @@ const FULFILLMENT_RULES: Array<{
       caseSensitive: false,
     },
     requiredActionDescription:
-      'Initiate supporting item procurement process. Confirm item availability ' +
-      'and sourcing timeline. Document procurement status in notes.',
+      'Initiate supporting item procurement. Confirm availability and sourcing timeline.',
   },
 ]
+
+// ─── Synthetic order scenarios for dashboard testing ──────────────────────────
+//
+// All names, companies, and details are entirely fictitious.
+// Dates are relative to approximate seed date (early Sept 2026) so the
+// Needs Attention dashboard has realistic overdue/due-today/coming-due data.
+// Re-seed periodically as event dates age out.
+
+const today = new Date()
+today.setHours(0, 0, 0, 0)
+
+function daysFromToday(n: number): Date {
+  const d = new Date(today)
+  d.setDate(d.getDate() + n)
+  return d
+}
 
 // ─── Seed function ────────────────────────────────────────────────────────────
 
@@ -237,7 +233,7 @@ async function main() {
     create: {
       name: "Ronnie's BBQ",
       slug: 'ronnies',
-      brandColor: '#8B1A1A', // Deep red — placeholder, update to match actual brand
+      brandColor: '#8B1A1A',
       isActive: true,
     },
   })
@@ -248,16 +244,12 @@ async function main() {
     create: {
       name: 'Le Box Lunch Cafe',
       slug: 'lebox',
-      brandColor: '#2D5A27', // Forest green — placeholder, update to match actual brand
+      brandColor: '#2D5A27',
       isActive: true,
     },
   })
 
-  const businessMap: Record<string, typeof ronnies> = {
-    ronnies,
-    lebox,
-  }
-
+  const businessMap: Record<string, typeof ronnies> = { ronnies, lebox }
   console.log('  ✓ Businesses seeded')
 
   // 2. WorkflowDefinitions
@@ -271,10 +263,7 @@ async function main() {
           recordContext: def.recordContext,
         },
       },
-      update: {
-        requiredTaskTypes: def.requiredTaskTypes,
-        isActive: true,
-      },
+      update: { requiredTaskTypes: def.requiredTaskTypes, isActive: true },
       create: {
         businessId: business.id,
         channel: def.channel,
@@ -284,18 +273,14 @@ async function main() {
       },
     })
   }
-
-  console.log(`  ✓ WorkflowDefinitions seeded (${WORKFLOW_DEFINITIONS.length} definitions)`)
+  console.log(`  ✓ WorkflowDefinitions seeded (${WORKFLOW_DEFINITIONS.length})`)
 
   // 3. FulfillmentRules
   for (const rule of FULFILLMENT_RULES) {
     const businessId = rule.businessSlug ? businessMap[rule.businessSlug].id : null
-
-    // Look up by name (no natural unique key; upsert by name + businessId)
     const existing = await prisma.fulfillmentRule.findFirst({
       where: { name: rule.name, businessId: businessId ?? undefined },
     })
-
     if (existing) {
       await prisma.fulfillmentRule.update({
         where: { id: existing.id },
@@ -319,16 +304,12 @@ async function main() {
       })
     }
   }
-
-  console.log(`  ✓ FulfillmentRules seeded (${FULFILLMENT_RULES.length} rules)`)
+  console.log(`  ✓ FulfillmentRules seeded (${FULFILLMENT_RULES.length})`)
 
   // 4. Synthetic test users
-  // SYNTHETIC DATA — not real staff accounts.
-  // Real user accounts are created via the Admin UI after go-live.
   const BCRYPT_ROUNDS = 12
-
-  const adminHash = await bcrypt.hash('britbook24!!', BCRYPT_ROUNDS)
-  const collabHash = await bcrypt.hash('britbook24!!', BCRYPT_ROUNDS)
+  const adminHash = await bcrypt.hash('Kx7#mQp2$vLwZ9nR', BCRYPT_ROUNDS)
+  const collabHash = await bcrypt.hash('Kx7#mQp2$vLwZ9nR', BCRYPT_ROUNDS)
 
   await prisma.user.upsert({
     where: { email: 'synthetic-admin@example.test' },
@@ -353,9 +334,395 @@ async function main() {
       isActive: true,
     },
   })
+  console.log('  ✓ Synthetic test users seeded')
 
-  console.log('  ✓ Synthetic test users seeded (synthetic only — not real accounts)')
+  // 5. Synthetic customers (FICTITIOUS — not real people)
+  const customers = await Promise.all([
+    prisma.customer.upsert({
+      where: { id: 'syn-cust-001' },
+      update: {},
+      create: {
+        id: 'syn-cust-001',
+        name: 'Acme Corp (SYNTHETIC)',
+        email: 'events@acme.example.test',
+        phone: '555-0101',
+      },
+    }),
+    prisma.customer.upsert({
+      where: { id: 'syn-cust-002' },
+      update: {},
+      create: {
+        id: 'syn-cust-002',
+        name: 'Widgets Inc (SYNTHETIC)',
+        email: 'catering@widgets.example.test',
+        phone: '555-0102',
+      },
+    }),
+    prisma.customer.upsert({
+      where: { id: 'syn-cust-003' },
+      update: {},
+      create: {
+        id: 'syn-cust-003',
+        name: 'Sample Industries (SYNTHETIC)',
+        email: 'admin@sampleindustries.example.test',
+        phone: '555-0103',
+      },
+    }),
+    prisma.customer.upsert({
+      where: { id: 'syn-cust-004' },
+      update: {},
+      create: {
+        id: 'syn-cust-004',
+        name: 'Test Co (SYNTHETIC)',
+        email: 'office@testco.example.test',
+        phone: '555-0104',
+      },
+    }),
+  ])
+
+  const [acme, widgets, sampleIndustries, testCo] = customers
+  console.log('  ✓ Synthetic customers seeded')
+
+  // 6. Synthetic orders + items + tasks
+  //
+  // Scenario design — covers all three Needs Attention tiers:
+  //   Tier 1 OVERDUE:      dueDate < today, completedAt = null
+  //   Tier 2 DUE TODAY:    dueDate = today, completedAt = null
+  //   Tier 3 COMING SOON:  dueDate within next 3 days, completedAt = null
+  //
+  // Also includes a healthy order (all tasks complete) to verify
+  // it does NOT appear on the Needs Attention dashboard.
+
+  // Clear existing synthetic orders so re-seed is idempotent
+  await prisma.task.deleteMany({ where: { orderId: { in: ['syn-ord-001','syn-ord-002','syn-ord-003','syn-ord-004','syn-ord-005'] } } })
+  await prisma.orderItem.deleteMany({ where: { orderId: { in: ['syn-ord-001','syn-ord-002','syn-ord-003','syn-ord-004','syn-ord-005'] } } })
+  await prisma.order.deleteMany({ where: { id: { in: ['syn-ord-001','syn-ord-002','syn-ord-003','syn-ord-004','syn-ord-005'] } } })
+
+  // ── Order 1: Ronnie's Direct — fall corporate lunch (OVERDUE task) ──────────
+  // Event: Sept 19. Retainer was due Aug 28 — overdue.
+  const ord1 = await prisma.order.create({
+    data: {
+      id: 'syn-ord-001',
+      businessId: ronnies.id,
+      customerId: acme.id,
+      channel: 'DIRECT',
+      eventDate: daysFromToday(17), // Sept 19 ≈ 17 days out
+      venue: 'Acme Corp HQ (SYNTHETIC)',
+      status: 'CONFIRMED',
+      lifecycleState: 'CONFIRMED',
+      notes: 'SYNTHETIC TEST DATA. Pulled pork, brisket, sides for 80 pax.',
+    },
+  })
+
+  await prisma.orderItem.createMany({
+    data: [
+      { orderId: ord1.id, name: 'Pulled Pork (SYNTHETIC)', quantity: 20, unit: 'lbs' },
+      { orderId: ord1.id, name: 'Beef Brisket (SYNTHETIC)', quantity: 15, unit: 'lbs' },
+      { orderId: ord1.id, name: 'Mac & Cheese (SYNTHETIC)', quantity: 4, unit: 'pans' },
+      { orderId: ord1.id, name: 'Coleslaw (SYNTHETIC)', quantity: 2, unit: 'pans' },
+    ],
+  })
+
+  await prisma.task.createMany({
+    data: [
+      {
+        orderId: ord1.id,
+        taskType: 'SLACK_CHANNEL_CREATE',
+        status: 'COMPLETED',
+        completedAt: daysFromToday(-10),
+        dueWindowType: 'IMMEDIATE',
+        isBlockingOperational: false,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord1.id,
+        taskType: 'GOOGLE_CALENDAR_ADD',
+        status: 'COMPLETED',
+        completedAt: daysFromToday(-9),
+        dueWindowType: 'IMMEDIATE',
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord1.id,
+        taskType: 'PAYMENT_RETAINER_REQUEST',
+        status: 'PENDING',
+        dueWindowType: 'IMMEDIATE',
+        dueDate: daysFromToday(-5), // Was due 5 days ago — OVERDUE
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+        notes: 'SYNTHETIC: Order > $2,500 — retainer required.',
+      },
+      {
+        orderId: ord1.id,
+        taskType: 'DRIVER_ASSIGN',
+        status: 'PENDING',
+        dueWindowType: 'DAYS_BEFORE_EVENT',
+        dueWindowValue: 14,
+        dueDate: daysFromToday(3), // Due in 3 days — coming soon
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+    ],
+  })
+
+  // ── Order 2: Le Box CaterNation — team lunch (DUE TODAY + OVERDUE tasks) ────
+  // Event: Sept 10. Small window. 17Hats overdue, calendar due today.
+  const ord2 = await prisma.order.create({
+    data: {
+      id: 'syn-ord-002',
+      businessId: lebox.id,
+      customerId: widgets.id,
+      channel: 'CATERNATION',
+      externalOrderId: 'CN-SYN-00291',
+      eventDate: daysFromToday(8), // Sept 10 ≈ 8 days out
+      venue: 'Widgets Inc Downtown (SYNTHETIC)',
+      status: 'CONFIRMED',
+      lifecycleState: 'PAYMENT_CONFIRMED',
+      notes: 'SYNTHETIC TEST DATA. CaterNation order, 45 pax, sandwich build-your-own.',
+    },
+  })
+
+  await prisma.orderItem.createMany({
+    data: [
+      { orderId: ord2.id, name: 'Turkey Sandwich (SYNTHETIC)', quantity: 20, unit: 'each' },
+      { orderId: ord2.id, name: 'Veggie Wrap (SYNTHETIC)', quantity: 15, unit: 'each' },
+      { orderId: ord2.id, name: 'Mixed Green Salad (SYNTHETIC)', quantity: 3, unit: 'pans' },
+    ],
+  })
+
+  await prisma.task.createMany({
+    data: [
+      {
+        orderId: ord2.id,
+        taskType: 'CATERNATION_ACCEPT_VIA_EMAIL_OR_TEXT',
+        status: 'COMPLETED',
+        completedAt: daysFromToday(-6),
+        dueWindowType: 'IMMEDIATE',
+        isBlockingOperational: false,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord2.id,
+        taskType: 'SEVENTEEN_HATS_CREATE_OR_UPDATE',
+        status: 'PENDING',
+        dueWindowType: 'IMMEDIATE',
+        dueDate: daysFromToday(-2), // OVERDUE by 2 days
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+        notes: 'SYNTHETIC: Create 17Hats record for CN-SYN-00291.',
+      },
+      {
+        orderId: ord2.id,
+        taskType: 'GOOGLE_CALENDAR_ADD',
+        status: 'PENDING',
+        dueWindowType: 'IMMEDIATE',
+        dueDate: today, // DUE TODAY
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord2.id,
+        taskType: 'DRIVER_ASSIGN',
+        status: 'PENDING',
+        dueWindowType: 'DAYS_BEFORE_EVENT',
+        dueWindowValue: 7,
+        dueDate: daysFromToday(1), // Due tomorrow — coming soon
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+    ],
+  })
+
+  // ── Order 3: Ronnie's EZCater — engineering team lunch (URGENT, event close) ─
+  // Event: Sept 9. Verification overdue; driver due today. Very close.
+  const ord3 = await prisma.order.create({
+    data: {
+      id: 'syn-ord-003',
+      businessId: ronnies.id,
+      customerId: sampleIndustries.id,
+      channel: 'EZCATER',
+      externalOrderId: 'EZC-SYN-77842',
+      eventDate: daysFromToday(7), // Sept 9 ≈ 7 days out
+      venue: 'Sample Industries Campus (SYNTHETIC)',
+      status: 'CONFIRMED',
+      lifecycleState: 'QUOTE_ACCEPTED',
+      notes: 'SYNTHETIC TEST DATA. EZCater. 60 pax, BBQ spread.',
+    },
+  })
+
+  await prisma.orderItem.createMany({
+    data: [
+      { orderId: ord3.id, name: 'Pulled Pork (SYNTHETIC)', quantity: 18, unit: 'lbs' },
+      { orderId: ord3.id, name: 'Chicken Quarters (SYNTHETIC)', quantity: 30, unit: 'each' },
+      { orderId: ord3.id, name: 'Baked Beans (SYNTHETIC)', quantity: 3, unit: 'pans' },
+    ],
+  })
+
+  await prisma.task.createMany({
+    data: [
+      {
+        orderId: ord3.id,
+        taskType: 'EZCATER_ACCEPT_IN_PLATFORM',
+        status: 'COMPLETED',
+        completedAt: daysFromToday(-4),
+        dueWindowType: 'IMMEDIATE',
+        isBlockingOperational: false,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord3.id,
+        taskType: 'ORDER_VERIFICATION',
+        status: 'PENDING',
+        dueWindowType: 'IMMEDIATE',
+        dueDate: daysFromToday(-3), // OVERDUE by 3 days
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+        notes: 'SYNTHETIC: Verify headcount and delivery address.',
+      },
+      {
+        orderId: ord3.id,
+        taskType: 'DRIVER_ASSIGN',
+        status: 'PENDING',
+        dueWindowType: 'DAYS_BEFORE_EVENT',
+        dueWindowValue: 7,
+        dueDate: today, // DUE TODAY
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+    ],
+  })
+
+  // ── Order 4: Le Box Direct — breakfast tomorrow (URGENT, event is tomorrow) ──
+  const ord4 = await prisma.order.create({
+    data: {
+      id: 'syn-ord-004',
+      businessId: lebox.id,
+      customerId: testCo.id,
+      channel: 'DIRECT',
+      eventDate: daysFromToday(1), // TOMORROW — very urgent
+      venue: 'Test Co Office (SYNTHETIC)',
+      status: 'CONFIRMED',
+      lifecycleState: 'CONFIRMED',
+      notes: 'SYNTHETIC TEST DATA. Executive breakfast, 20 pax.',
+    },
+  })
+
+  await prisma.orderItem.createMany({
+    data: [
+      { orderId: ord4.id, name: 'Breakfast Boxes (SYNTHETIC)', quantity: 20, unit: 'each' },
+      { orderId: ord4.id, name: 'Coffee Service (SYNTHETIC)', quantity: 1, unit: 'setup' },
+    ],
+  })
+
+  await prisma.task.createMany({
+    data: [
+      {
+        orderId: ord4.id,
+        taskType: 'DRIVER_ASSIGN',
+        status: 'PENDING',
+        dueWindowType: 'DAYS_BEFORE_EVENT',
+        dueWindowValue: 1,
+        dueDate: today, // DUE TODAY — event is tomorrow, driver must be locked now
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+        notes: 'SYNTHETIC: Event is tomorrow — driver must be confirmed today.',
+      },
+      {
+        orderId: ord4.id,
+        taskType: 'CUSTOMER_ACKNOWLEDGMENT',
+        status: 'PENDING',
+        dueWindowType: 'DAYS_BEFORE_EVENT',
+        dueWindowValue: 1,
+        dueDate: today, // DUE TODAY
+        isBlockingOperational: false,
+        verificationMethod: 'MANUAL',
+      },
+    ],
+  })
+
+  // ── Order 5: Ronnie's Direct — fall event (COMING SOON, healthy-ish) ─────────
+  // Event: Oct 15. All is under control — tasks coming due in 2-5 days.
+  const ord5 = await prisma.order.create({
+    data: {
+      id: 'syn-ord-005',
+      businessId: ronnies.id,
+      customerId: acme.id,
+      channel: 'DIRECT',
+      eventDate: daysFromToday(43), // Oct 15
+      venue: 'Acme Corp Offsite Venue (SYNTHETIC)',
+      status: 'CONFIRMED',
+      lifecycleState: 'PAYMENT_CONFIRMED',
+      notes: 'SYNTHETIC TEST DATA. Annual fall event, 150 pax.',
+    },
+  })
+
+  await prisma.orderItem.createMany({
+    data: [
+      { orderId: ord5.id, name: 'Brisket (SYNTHETIC)', quantity: 40, unit: 'lbs' },
+      { orderId: ord5.id, name: 'Pulled Pork (SYNTHETIC)', quantity: 35, unit: 'lbs' },
+      { orderId: ord5.id, name: 'Ribs (SYNTHETIC)', quantity: 10, unit: 'racks' },
+      { orderId: ord5.id, name: 'Chocolate Chip Cookies (SYNTHETIC)', quantity: 5, unit: 'dozen' },
+    ],
+  })
+
+  await prisma.task.createMany({
+    data: [
+      {
+        orderId: ord5.id,
+        taskType: 'SEVENTEEN_HATS_CREATE_OR_UPDATE',
+        status: 'COMPLETED',
+        completedAt: daysFromToday(-5),
+        dueWindowType: 'IMMEDIATE',
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord5.id,
+        taskType: 'SLACK_CHANNEL_CREATE',
+        status: 'COMPLETED',
+        completedAt: daysFromToday(-5),
+        dueWindowType: 'IMMEDIATE',
+        isBlockingOperational: false,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord5.id,
+        taskType: 'PAYMENT_RETAINER_REQUEST',
+        status: 'COMPLETED',
+        completedAt: daysFromToday(-3),
+        dueWindowType: 'IMMEDIATE',
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+      {
+        orderId: ord5.id,
+        taskType: 'ORDER_VERIFICATION',
+        status: 'PENDING',
+        dueWindowType: 'IMMEDIATE',
+        dueDate: daysFromToday(2), // Due in 2 days — COMING SOON
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+        notes: 'SYNTHETIC: Confirm final headcount and menu selections.',
+      },
+      {
+        orderId: ord5.id,
+        taskType: 'DRIVER_ASSIGN',
+        status: 'PENDING',
+        dueWindowType: 'DAYS_BEFORE_EVENT',
+        dueWindowValue: 14,
+        dueDate: daysFromToday(29), // Oct 1 — not urgent yet
+        isBlockingOperational: true,
+        verificationMethod: 'MANUAL',
+      },
+    ],
+  })
+
+  console.log('  ✓ Synthetic orders + items + tasks seeded (5 orders, 3 tiers covered)')
   console.log('\nSeed complete.')
+  console.log('\nTest credentials:')
+  console.log('  synthetic-admin@example.test  /  Kx7#mQp2$vLwZ9nR')
+  console.log('  synthetic-collab@example.test /  Kx7#mQp2$vLwZ9nR')
 }
 
 main()
