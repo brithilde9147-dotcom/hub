@@ -1,5 +1,6 @@
 // Operations Control Hub — Prisma Schema
-// Phase 1 — synthetic/config data only
+// Phase 2 — synthetic/config data only. Privacy gate: no live operational data
+// until Missy reviews and Brittany explicitly approves.
 // No real Ronnie's or Le Box customer, order, pricing, or document data in this file.
 //
 // Key architecture constraints (from approved Architecture Brief):
@@ -33,11 +34,39 @@ enum RecordContext {
   ORDER_UPDATE
 }
 
+// Full sales/ops pipeline. Distinct from OrderStatus (active/cancelled/complete).
+// operationallyReady is COMPUTED from blocking Task completion — never stored.
+enum OrderLifecycleState {
+  INQUIRY_RECEIVED
+  READY_TO_QUOTE
+  QUOTE_PRODUCTION
+  PRE_SEND_REVIEW
+  QUOTE_SENT
+  QUOTE_ACCEPTED
+  PAYMENT_CONFIRMED
+  CONFIRMED
+  CLOSED
+}
+
 enum OrderStatus {
   INQUIRY
   CONFIRMED
   CANCELLED
   COMPLETED
+}
+
+// When the task becomes due relative to the order/event.
+enum TaskDueWindowType {
+  IMMEDIATE          // Due on task creation
+  AT_LIFECYCLE_STATE // Due when order reaches a specific OrderLifecycleState
+  DAYS_BEFORE_EVENT  // Due N days before eventDate
+  ON_EVENT_DATE      // Due on the event date itself
+}
+
+// V1: MANUAL only. Field is extensible — add values here when integrations
+// are approved; no model migration required.
+enum TaskVerificationMethod {
+  MANUAL
 }
 
 enum TaskType {
@@ -151,42 +180,48 @@ model Customer {
 }
 
 model Order {
-  id                        String      @id @default(uuid())
+  id                        String             @id @default(uuid())
   businessId                String
   customerId                String
   channel                   Channel
-  externalOrderId           String?     // EZCater or CaterNation order number
-  eventDate                 DateTime    @db.Date
+  externalOrderId           String?            // EZCater or CaterNation order number
+  eventDate                 DateTime           @db.Date
   venue                     String?
-  status                    OrderStatus @default(INQUIRY)
+  status                    OrderStatus        @default(INQUIRY)
+
+  // Sales/ops pipeline stage. Updated manually; does not auto-advance.
+  lifecycleState            OrderLifecycleState @default(INQUIRY_RECEIVED)
 
   // Immutable once true. Must not be reset after being set.
   // Setting this to true is a deliberate human action — not automatic.
   originalProcessingComplete Boolean    @default(false)
 
-  // operationalReadiness: COMPUTED — see src/lib/operational-readiness.ts
-  // hasUnresolvedUpdates:  COMPUTED — see src/lib/operational-readiness.ts
+  // operationallyReady: COMPUTED — derived from open blocking Tasks.
+  //   = !tasks.some(t => t.isBlockingOperational && !t.completedAt)
+  // hasUnresolvedUpdates: COMPUTED — see src/lib/operational-readiness.ts
   // Neither field is stored in the database.
 
   notes     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  business             Business               @relation(fields: [businessId], references: [id])
-  customer             Customer               @relation(fields: [customerId], references: [id])
-  updates              OrderUpdate[]
-  tasks                Task[]
-  milestones           Milestone[]
-  documents            Document[]
-  payments             Payment[]
-  delivery             DeliveryRecord?
+  business              Business               @relation(fields: [businessId], references: [id])
+  customer              Customer               @relation(fields: [customerId], references: [id])
+  items                 OrderItem[]
+  updates               OrderUpdate[]
+  tasks                 Task[]
+  milestones            Milestone[]
+  documents             Document[]
+  payments              Payment[]
+  delivery              DeliveryRecord?
   orderFulfillmentRules OrderFulfillmentRule[]
-  auditLogs            AuditLog[]
+  auditLogs             AuditLog[]
 
   @@index([businessId])
   @@index([customerId])
   @@index([eventDate])
   @@index([status])
+  @@index([lifecycleState])
 }
 
 model OrderUpdate {
@@ -210,6 +245,25 @@ model OrderUpdate {
 
   @@index([orderId])
   @@index([resolutionState])
+}
+
+// ─── Order Items ─────────────────────────────────────────────────────────────
+
+model OrderItem {
+  // Line items on an order. V1: entered manually or extracted from documents.
+  // Items drive FulfillmentRule triggers (e.g., "cookie" → cookie task).
+  id        String   @id @default(uuid())
+  orderId   String
+  name      String   // e.g., "Pulled Pork", "Chocolate Chip Cookies"
+  quantity  Float?   // null = unspecified
+  unit      String?  // "lbs", "pans", "each", "dozen", etc.
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
 }
 
 // ─── Rules Engine ────────────────────────────────────────────────────────────
@@ -294,6 +348,25 @@ model Task {
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
 
+  // ── Operational readiness gate ──────────────────────────────────────────────
+  // If true, order.operationallyReady = false until this task is completed.
+  // operationallyReady is computed: !tasks.some(t => t.isBlockingOperational && !t.completedAt)
+  isBlockingOperational Boolean @default(false)
+
+  // ── Due window ──────────────────────────────────────────────────────────────
+  // Defines when this task becomes due. dueDate is the materialized value
+  // (computed when task is created or event date changes) for efficient querying.
+  dueWindowType     TaskDueWindowType    @default(IMMEDIATE)
+  dueWindowValue    Int?                 // Days for DAYS_BEFORE_EVENT; null otherwise
+  dueWindowStateRef OrderLifecycleState? // Required when dueWindowType = AT_LIFECYCLE_STATE
+  dueDate           DateTime?            // Materialized. Null = not yet calculable.
+
+  // ── Verification ────────────────────────────────────────────────────────────
+  // V1: MANUAL — staff marks complete inside the Hub.
+  // Extensible: add values to TaskVerificationMethod enum when integrations
+  // are approved, without requiring a model migration.
+  verificationMethod TaskVerificationMethod @default(MANUAL)
+
   order       Order        @relation(fields: [orderId], references: [id])
   orderUpdate OrderUpdate? @relation(fields: [orderUpdateId], references: [id])
   assignedTo  User?        @relation("TaskAssignee", fields: [assignedToId], references: [id])
@@ -303,6 +376,8 @@ model Task {
   @@index([orderUpdateId])
   @@index([status])
   @@index([taskType])
+  @@index([dueDate])
+  @@index([isBlockingOperational])
 }
 
 // ─── Milestones ──────────────────────────────────────────────────────────────
