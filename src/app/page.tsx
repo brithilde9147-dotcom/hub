@@ -205,9 +205,9 @@ function TaskRow({ task, tierColor }: { task: TaskWithOrder; tierColor: string }
         {/* Order header */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
           <BusinessBadge slug={task.order.business.slug} color={task.order.business.brandColor} />
-          <span style={{ fontWeight: 600, fontSize: '14px', color: '#111827' }}>
-            {task.order.customer.name.replace(' (SYNTHETIC)', '')}
-          </span>
+          <a href={`/orders/${task.order.id}`} style={{ fontWeight: 600, fontSize: '14px', color: '#111827', textDecoration: 'none' }}>
+  {task.order.customer.name.replace(' (SYNTHETIC)', '')}
+</a>
           <ChannelTag channel={task.order.channel} />
           <span style={{
             fontSize: '12px',
